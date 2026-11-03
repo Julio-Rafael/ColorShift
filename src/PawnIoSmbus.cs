@@ -1,5 +1,6 @@
-// Acesso ao SMBus pelo driver PawnIO, portado de i2c_smbus/Windows/i2c_smbus_pawnio.cpp do OpenRGB
-// (SPDX-License-Identifier: GPL-2.0-or-later, Stephen Horvath / Adam Honse e colaboradores).
+// Acesso ao SMBus do chipset pelo driver PawnIO (https://pawnio.eu).
+// Usa apenas a API pública do PawnIOLib.dll e as funções que os módulos assinados SmbusI801.bin / SmbusPIIX4.bin
+// exportam (ioctl_smbus_xfer, ioctl_set_sleep_mode, ioctl_piix4_port_sel), lidas dos próprios módulos.
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -9,244 +10,233 @@ using System.Windows.Forms;
 
 namespace ColorShift
 {
-    /// <summary>
-    /// Um barramento SMBus do chipset aberto pelo PawnIO. O PawnIO é um driver assinado que só executa módulos
-    /// assinados; o módulo (SmbusI801.bin para Intel, SmbusPIIX4.bin para AMD) é quem fala com o hardware.
-    /// </summary>
-    sealed class PawnIoSmbus : IDisposable
+    /// <summary>Chamadas nativas do PawnIOLib.dll. Todas retornam um HRESULT (0 = sucesso).</summary>
+    static class PawnIoNative
     {
-        const int SmbusRead = 1;
-        const int SmbusWrite = 0;
-        const int SizeByte = 1;
-        const int SizeByteData = 2;
-        const int SizeWordData = 3;
-        const int SizeBlockData = 5;
-        const int BlockMax = 32;
+        const string Dll = "PawnIOLib.dll";
 
-        // Mesmo mutex do OpenRGB, HWiNFO, SignalRGB etc.: impede que dois programas misturem transações no barramento.
-        const string GlobalMutexName = "Global\\Access_SMBUS.HTP.Method";
-        const int SleepModeAlwaysSleep = 2;
-        const int AccessDenied = unchecked((int)0x80070005);
-
-        [DllImport("PawnIOLib.dll")] static extern int pawnio_version(out uint version);
-        [DllImport("PawnIOLib.dll")] static extern int pawnio_open(out IntPtr handle);
-        [DllImport("PawnIOLib.dll")] static extern int pawnio_load(IntPtr handle, byte[] blob, UIntPtr size);
-        [DllImport("PawnIOLib.dll")] static extern int pawnio_close(IntPtr handle);
-        [DllImport("PawnIOLib.dll", CharSet = CharSet.Ansi, BestFitMapping = false)]
-        static extern int pawnio_execute(IntPtr handle, string name, ulong[] input, UIntPtr inSize,
-            ulong[] output, UIntPtr outSize, out UIntPtr returnSize);
+        [DllImport(Dll)] public static extern int pawnio_version(out uint version);
+        [DllImport(Dll)] public static extern int pawnio_open(out IntPtr handle);
+        [DllImport(Dll)] public static extern int pawnio_load(IntPtr handle, byte[] blob, UIntPtr size);
+        [DllImport(Dll)] public static extern int pawnio_close(IntPtr handle);
+        [DllImport(Dll, CharSet = CharSet.Ansi, BestFitMapping = false, ThrowOnUnmappableChar = true)]
+        public static extern int pawnio_execute(IntPtr handle, string function, ulong[] input, UIntPtr inputCount,
+            ulong[] output, UIntPtr outputCount, out UIntPtr returnedCount);
 
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-        static extern IntPtr LoadLibrary(string path);
+        public static extern IntPtr LoadLibrary(string path);
 
-        static bool _libraryLoaded;
+        public const int E_ACCESSDENIED = unchecked((int)0x80070005);
 
-        IntPtr _handle;
-        readonly Mutex _globalMutex;
-        readonly object _lock = new object();
+        static bool _ready;
 
-        public string Name { get; private set; }
-        public int PciVendor { get; private set; }
-        public int PciDevice { get; private set; }
-
-        PawnIoSmbus(IntPtr handle, string name)
+        /// <summary>Carrega o PawnIOLib.dll (ao lado do exe ou da instalação do PawnIO).</summary>
+        public static void Load()
         {
-            _handle = handle;
-            Name = name;
-            ReadIdentity();
-            Execute("ioctl_set_sleep_mode", new ulong[] { SleepModeAlwaysSleep }, 0); // o módulo pode não ter; ignora erro
-            try
+            if (_ready) return;
+            string here = Path.GetDirectoryName(Application.ExecutablePath);
+            string installed = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "PawnIO");
+            foreach (string dir in new[] { here, installed })
             {
-                bool created;
-                _globalMutex = new Mutex(false, GlobalMutexName, out created);
-            }
-            catch (UnauthorizedAccessException) { _globalMutex = null; }
-        }
-
-        /// <summary>Carrega o PawnIOLib.dll instalado pelo PawnIO (ou ao lado do exe). Falha se o driver não está instalado.</summary>
-        public static void EnsureLibrary()
-        {
-            if (_libraryLoaded) return;
-            string appDir = Path.GetDirectoryName(Application.ExecutablePath);
-            var candidates = new[]
-            {
-                Path.Combine(appDir, "PawnIOLib.dll"),
-                Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "PawnIO", "PawnIOLib.dll")
-            };
-            foreach (string path in candidates)
-            {
-                if (File.Exists(path) && LoadLibrary(path) != IntPtr.Zero)
-                {
-                    uint version;
-                    if (pawnio_version(out version) == 0)
-                    {
-                        _libraryLoaded = true;
-                        return;
-                    }
-                }
+                string dll = Path.Combine(dir, Dll);
+                if (!File.Exists(dll) || LoadLibrary(dll) == IntPtr.Zero) continue;
+                uint version;
+                if (pawnio_version(out version) == 0) { _ready = true; return; }
             }
             throw new PawnIoException("O driver PawnIO não está instalado. Instale-o em https://pawnio.eu e tente de novo.");
         }
+    }
 
-        /// <summary>Abre os barramentos de memória que existirem nesta placa (mesma ordem do OpenRGB).</summary>
-        public static List<PawnIoSmbus> OpenDramBuses()
+    /// <summary>Um módulo PawnIO carregado no driver (uma instância por barramento).</summary>
+    sealed class PawnIoModule : IDisposable
+    {
+        IntPtr _handle;
+
+        PawnIoModule(IntPtr handle) { _handle = handle; }
+
+        /// <summary>Carrega o módulo. Retorna null se ele não serve para este chipset.</summary>
+        public static PawnIoModule TryLoad(string fileName)
         {
-            EnsureLibrary();
-            var buses = new List<PawnIoSmbus>();
-            IntPtr handle;
-
-            if (TryStart("SmbusI801.bin", out handle))
-                buses.Add(new PawnIoSmbus(handle, "i801"));
-
-            for (int port = 0; port < 2; port++)
-            {
-                if (!TryStart("SmbusPIIX4.bin", out handle)) continue;
-                var output = new ulong[1];
-                UIntPtr returned;
-                if (pawnio_execute(handle, "ioctl_piix4_port_sel", new ulong[] { (ulong)port }, (UIntPtr)1u,
-                        output, (UIntPtr)1u, out returned) == 0)
-                    buses.Add(new PawnIoSmbus(handle, "piix4_" + port));
-                else
-                    pawnio_close(handle);
-            }
-            return buses;
-        }
-
-        static bool TryStart(string module, out IntPtr handle)
-        {
-            handle = IntPtr.Zero;
-            string path = FindModule(module);
-            if (path == null) return false;
+            string path = Locate(fileName);
+            if (path == null) return null;
             byte[] blob = File.ReadAllBytes(path);
 
-            int status = pawnio_open(out handle);
-            if (status == AccessDenied)
+            IntPtr handle;
+            int hr = PawnIoNative.pawnio_open(out handle);
+            if (hr == PawnIoNative.E_ACCESSDENIED)
                 throw new PawnIoException("Sem permissão para abrir o PawnIO. Execute o ColorShift como administrador.");
-            if (status != 0)
-                throw new PawnIoException("Não foi possível abrir o driver PawnIO (0x" + status.ToString("X8") + ").");
+            if (hr != 0)
+                throw new PawnIoException("Não foi possível abrir o driver PawnIO (0x" + hr.ToString("X8") + ").");
 
-            status = pawnio_load(handle, blob, (UIntPtr)(uint)blob.Length);
-            if (status != 0)
+            if (PawnIoNative.pawnio_load(handle, blob, (UIntPtr)(uint)blob.Length) != 0)
             {
-                // ERROR_NOT_SUPPORTED = este chipset não é desse fabricante; é o caso normal de um dos dois módulos.
-                pawnio_close(handle);
-                handle = IntPtr.Zero;
-                return false;
+                PawnIoNative.pawnio_close(handle); // o módulo recusou o chipset (é de outro fabricante)
+                return null;
             }
-            return true;
+            return new PawnIoModule(handle);
         }
 
-        static string FindModule(string module)
+        static string Locate(string fileName)
         {
-            string appDir = Path.GetDirectoryName(Application.ExecutablePath);
-            foreach (string path in new[] { Path.Combine(appDir, module), Path.Combine(appDir, "pawnio", module) })
-                if (File.Exists(path)) return path;
+            string here = Path.GetDirectoryName(Application.ExecutablePath);
+            string[] places = { Path.Combine(here, fileName), Path.Combine(here, "pawnio", fileName) };
+            foreach (string p in places) if (File.Exists(p)) return p;
             return null;
         }
 
-        void ReadIdentity()
+        /// <summary>Executa uma função exportada pelo módulo. Retorna o HRESULT.</summary>
+        public int Call(string function, ulong[] input, ulong[] output)
         {
-            var output = new ulong[3];
-            if (Execute("ioctl_identity", new ulong[] { 0 }, output) != 0) return;
-            PciVendor = (int)(output[2] & 0xFFFF);
-            PciDevice = (int)((output[2] >> 16) & 0xFFFF);
-        }
-
-        int Execute(string function, ulong[] input, int outputCount)
-        {
-            return Execute(function, input, new ulong[Math.Max(1, outputCount)]);
-        }
-
-        int Execute(string function, ulong[] input, ulong[] output)
-        {
+            if (_handle == IntPtr.Zero) throw new ObjectDisposedException("PawnIoModule");
+            if (output == null || output.Length == 0) output = new ulong[1];
             UIntPtr returned;
-            return pawnio_execute(_handle, function, input, (UIntPtr)(uint)input.Length, output,
-                (UIntPtr)(uint)output.Length, out returned);
-        }
-
-        /// <summary>
-        /// Uma transação SMBus. <paramref name="data"/> é o i2c_smbus_data do Linux (34 bytes: byte, word ou bloco
-        /// com o tamanho em [0]). Retorna false se o dispositivo não respondeu.
-        /// </summary>
-        bool Transfer(int address, int readWrite, int command, int size, byte[] data)
-        {
-            var input = new ulong[9];
-            input[0] = (ulong)address;
-            input[1] = (ulong)readWrite;
-            input[2] = (ulong)command;
-            input[3] = (ulong)size;
-            if (data != null) Buffer.BlockCopy(data, 0, input, 4 * 8, Math.Min(data.Length, 5 * 8));
-            var output = new ulong[5];
-
-            int status;
-            lock (_lock)
-            {
-                if (_handle == IntPtr.Zero) throw new ObjectDisposedException("PawnIoSmbus");
-                bool owned = false;
-                if (_globalMutex != null)
-                {
-                    try { owned = _globalMutex.WaitOne(1000); }
-                    catch (AbandonedMutexException) { owned = true; }
-                    if (!owned) throw new PawnIoException("O SMBus está ocupado por outro programa.");
-                }
-                try { status = Execute("ioctl_smbus_xfer", input, output); }
-                finally { if (owned) _globalMutex.ReleaseMutex(); }
-            }
-
-            if (data != null) Buffer.BlockCopy(output, 0, data, 0, Math.Min(data.Length, 5 * 8));
-            return status == 0;
-        }
-
-        /// <summary>Lê um byte sem comando (usado para ver se há algo no endereço). -1 se ninguém respondeu.</summary>
-        public int ReadByte(int address)
-        {
-            var data = new byte[34];
-            return Transfer(address, SmbusRead, 0, SizeByte, data) ? data[0] : -1;
-        }
-
-        public int ReadByteData(int address, int command)
-        {
-            var data = new byte[34];
-            return Transfer(address, SmbusRead, command, SizeByteData, data) ? data[0] : -1;
-        }
-
-        public bool WriteByteData(int address, int command, byte value)
-        {
-            var data = new byte[34];
-            data[0] = value;
-            return Transfer(address, SmbusWrite, command, SizeByteData, data);
-        }
-
-        public bool WriteWordData(int address, int command, ushort value)
-        {
-            var data = new byte[34];
-            data[0] = (byte)value;
-            data[1] = (byte)(value >> 8);
-            return Transfer(address, SmbusWrite, command, SizeWordData, data);
-        }
-
-        public bool WriteBlockData(int address, int command, byte[] values, int offset, int length)
-        {
-            length = Math.Min(length, BlockMax);
-            var data = new byte[34];
-            data[0] = (byte)length;
-            Array.Copy(values, offset, data, 1, length);
-            return Transfer(address, SmbusWrite, command, SizeBlockData, data);
-        }
-
-        public override string ToString()
-        {
-            return "SMBus " + Name;
+            return PawnIoNative.pawnio_execute(_handle, function, input, (UIntPtr)(uint)input.Length,
+                output, (UIntPtr)(uint)output.Length, out returned);
         }
 
         public void Dispose()
         {
-            lock (_lock)
+            if (_handle != IntPtr.Zero) PawnIoNative.pawnio_close(_handle);
+            _handle = IntPtr.Zero;
+        }
+    }
+
+    /// <summary>
+    /// Um barramento SMBus do chipset (Intel i801 ou uma porta do AMD PIIX4), com as operações SMBus que os
+    /// pentes de memória usam.
+    /// </summary>
+    sealed class PawnIoSmbus : IDisposable
+    {
+        // Parâmetros de ioctl_smbus_xfer: endereço, direção, comando, tipo de transação e 40 bytes de dados.
+        enum Direction : ulong { Write = 0, Read = 1 }
+        enum Transaction : ulong { Byte = 1, ByteData = 2, WordData = 3, BlockData = 5 }
+
+        const int DataWords = 5;          // 5 × 8 = 40 bytes de área de dados
+        const int MaxBlockLength = 32;    // limite do SMBus para um bloco
+
+        // Mutex com nome compartilhado entre os programas que usam o SMBus no Windows (monitores de hardware,
+        // utilitários de RGB). Segurá-lo durante a transação evita que dois programas se misturem no barramento.
+        const string BusMutexName = "Global\\Access_SMBUS.HTP.Method";
+
+        readonly PawnIoModule _module;
+        readonly Mutex _busMutex;
+        readonly object _sync = new object();
+
+        public string Name { get; private set; }
+
+        PawnIoSmbus(PawnIoModule module, string name)
+        {
+            _module = module;
+            Name = name;
+            // Deixa o módulo esperar dormindo em vez de girar a CPU (nem toda versão tem essa função).
+            module.Call("ioctl_set_sleep_mode", new ulong[] { 2 }, null);
+            try { _busMutex = new Mutex(false, BusMutexName); }
+            catch (UnauthorizedAccessException) { _busMutex = null; }
+        }
+
+        /// <summary>Abre todos os barramentos SMBus que existirem nesta placa.</summary>
+        public static List<PawnIoSmbus> OpenDramBuses()
+        {
+            PawnIoNative.Load();
+            var result = new List<PawnIoSmbus>();
+
+            PawnIoModule intel = PawnIoModule.TryLoad("SmbusI801.bin");
+            if (intel != null) result.Add(new PawnIoSmbus(intel, "i801"));
+
+            // O PIIX4 (AMD) tem duas portas; cada uma precisa da sua instância do módulo.
+            for (ulong port = 0; port <= 1; port++)
             {
-                if (_handle != IntPtr.Zero) pawnio_close(_handle);
-                _handle = IntPtr.Zero;
+                PawnIoModule amd = PawnIoModule.TryLoad("SmbusPIIX4.bin");
+                if (amd == null) continue;
+                if (amd.Call("ioctl_piix4_port_sel", new[] { port }, null) == 0)
+                    result.Add(new PawnIoSmbus(amd, "piix4_" + port));
+                else
+                    amd.Dispose();
             }
-            if (_globalMutex != null) _globalMutex.Dispose();
+            return result;
+        }
+
+        /// <summary>Faz uma transação. <paramref name="data"/> entra e sai pela mesma área de 40 bytes.</summary>
+        bool Xfer(int address, Direction direction, int command, Transaction kind, byte[] data)
+        {
+            var request = new ulong[4 + DataWords];
+            request[0] = (ulong)address;
+            request[1] = (ulong)direction;
+            request[2] = (ulong)command;
+            request[3] = (ulong)kind;
+            Buffer.BlockCopy(data, 0, request, 4 * sizeof(ulong), Math.Min(data.Length, DataWords * sizeof(ulong)));
+            var reply = new ulong[DataWords];
+
+            int hr;
+            lock (_sync)
+            {
+                bool held = AcquireBus();
+                try { hr = _module.Call("ioctl_smbus_xfer", request, reply); }
+                finally { if (held) _busMutex.ReleaseMutex(); }
+            }
+            if (hr != 0) return false;
+            Buffer.BlockCopy(reply, 0, data, 0, Math.Min(data.Length, DataWords * sizeof(ulong)));
+            return true;
+        }
+
+        bool AcquireBus()
+        {
+            if (_busMutex == null) return false;
+            try
+            {
+                if (_busMutex.WaitOne(1000)) return true;
+            }
+            catch (AbandonedMutexException) { return true; }
+            throw new PawnIoException("O SMBus está ocupado por outro programa.");
+        }
+
+        static byte[] NewBuffer() { return new byte[DataWords * sizeof(ulong)]; }
+
+        /// <summary>Lê um byte sem comando (serve para ver se há algo no endereço). -1 se ninguém respondeu.</summary>
+        public int ReadByte(int address)
+        {
+            byte[] d = NewBuffer();
+            return Xfer(address, Direction.Read, 0, Transaction.Byte, d) ? d[0] : -1;
+        }
+
+        public int ReadByteData(int address, int command)
+        {
+            byte[] d = NewBuffer();
+            return Xfer(address, Direction.Read, command, Transaction.ByteData, d) ? d[0] : -1;
+        }
+
+        public bool WriteByteData(int address, int command, byte value)
+        {
+            byte[] d = NewBuffer();
+            d[0] = value;
+            return Xfer(address, Direction.Write, command, Transaction.ByteData, d);
+        }
+
+        /// <summary>Escreve uma palavra; o SMBus manda o byte baixo primeiro.</summary>
+        public bool WriteWordData(int address, int command, ushort value)
+        {
+            byte[] d = NewBuffer();
+            d[0] = (byte)(value & 0xFF);
+            d[1] = (byte)(value >> 8);
+            return Xfer(address, Direction.Write, command, Transaction.WordData, d);
+        }
+
+        /// <summary>Escreve um bloco: o primeiro byte da área é o tamanho, seguido dos dados.</summary>
+        public bool WriteBlockData(int address, int command, byte[] values, int offset, int length)
+        {
+            if (length > MaxBlockLength) length = MaxBlockLength;
+            byte[] d = NewBuffer();
+            d[0] = (byte)length;
+            Array.Copy(values, offset, d, 1, length);
+            return Xfer(address, Direction.Write, command, Transaction.BlockData, d);
+        }
+
+        public override string ToString() { return "SMBus " + Name; }
+
+        public void Dispose()
+        {
+            lock (_sync) _module.Dispose();
+            if (_busMutex != null) _busMutex.Dispose();
         }
     }
 

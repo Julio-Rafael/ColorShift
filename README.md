@@ -19,9 +19,15 @@ reversa documentada em [docs/ANALISE.md](docs/ANALISE.md).
 
 Tema **Sistema / Claro / Escuro**: seletor no topo da aba Saturação. "Sistema" segue o modo escuro do Windows.
 
+## Download
+
+Baixe o `ColorShift.zip` da página [Releases](https://github.com/Julio-Rafael/ColorShift/releases/latest),
+extraia numa pasta e abra o `ColorShift.exe`. Precisa do .NET Framework 4.x (já vem no Windows 10 e 11).
+Para a aba **Memória RAM**, instale também o driver [PawnIO](https://pawnio.eu).
+
 ## Como usar
 
-1. Abra `bin\ColorShift.exe`.
+1. Abra o `ColorShift.exe` (ou `bin\ColorShift.exe`, se você compilou).
 2. Clique em **Importar do vibranceGUI** para trazer seus perfis atuais (ex.: VALORANT), ou adicione jogos com
    **Adicionar .exe…** / **Processos abertos…**.
 3. Selecione um perfil e ajuste o nível dele. O controle de cima define o nível da área de trabalho.
@@ -59,6 +65,13 @@ Não é preciso instalar nenhum SDK.
 | `src/RamPage.cs` | Aba de LEDs da memória |
 | `pawnio/*.bin` | Módulos PawnIO assinados (de namazso/PawnIO.Modules), copiados para `bin` pelo `build.bat` |
 
-`PawnIoSmbus.cs` e `EneDram.cs` são portes para C# do código do OpenRGB (`i2c_smbus_pawnio.cpp` e
-`ENESMBusController`), que é **GPL-2.0-or-later**. Se for distribuir o ColorShift, ele precisa seguir essa licença.
 | `docs/ANALISE.md` | Relatório da engenharia reversa com o REA |
+
+O acesso ao SMBus e o controle dos LEDs são código próprio do ColorShift: usam só a API pública do PawnIO e as
+funções que os módulos assinados exportam, mais o mapa de registradores do chip ENE.
+
+## Licenças de terceiros
+
+Os módulos `SmbusI801.bin` e `SmbusPIIX4.bin` são de [namazso/PawnIO.Modules](https://github.com/namazso/PawnIO.Modules)
+(autor Steve-Tech), sob **LGPL-2.1-or-later**. Eles são distribuídos sem modificação; o código-fonte está nesse
+repositório. Veja [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) e [licenses/LGPL-2.1.txt](licenses/LGPL-2.1.txt).
