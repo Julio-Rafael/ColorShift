@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
@@ -94,7 +94,7 @@ namespace ColorShift
         [DllImport("user32.dll")]
         static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
 
-        readonly Timer _topmostTimer = new Timer { Interval = 1000 };
+        readonly Timer _topmostTimer = new Timer { Interval = 250 };
         CrosshairSettings _settings;
 
         public CrosshairOverlay()
@@ -108,7 +108,16 @@ namespace ColorShift
             DoubleBuffered = true;
             AutoScaleMode = AutoScaleMode.None;
             // Jogos costumam se colocar por cima; reafirma a posição de topo periodicamente.
-            _topmostTimer.Tick += (s, e) => SetWindowPos(Handle, HwndTopmost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate);
+            _topmostTimer.Tick += (s, e) => BringToTop();
+        }
+
+        /// <summary>
+        /// Ao voltar do Alt+Tab o jogo se marca como "topmost" e fica por cima da mira;
+        /// reafirma na hora e a cada 250 ms.
+        /// </summary>
+        void BringToTop()
+        {
+            if (Visible) SetWindowPos(Handle, HwndTopmost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate);
         }
 
         protected override bool ShowWithoutActivation
@@ -144,6 +153,7 @@ namespace ColorShift
             Bounds = new Rectangle(cx - r, cy - r, size, size);
             Invalidate();
             if (!Visible) Show();
+            BringToTop();
             _topmostTimer.Start();
         }
 

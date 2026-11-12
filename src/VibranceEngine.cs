@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Diagnostics;
 using System.Windows.Forms;
 
@@ -33,11 +33,31 @@ namespace ColorShift
 
         public void OnForeground(ForegroundInfo info)
         {
+            // Alt+Tab, Task View e overlays (Discord, Opera GX...) não tiram o jogo do estado ativo.
+            if (info.Transient && _foreground != null) return;
             _foreground = info;
             Apply();
         }
 
+        /// <summary>
+        /// Chamado periodicamente. O driver volta o vibrance ao padrão quando o jogo troca de modo
+        /// (Alt+Tab em tela cheia); reaplica na hora em vez de esperar o DisplaySettingsChanged.
+        /// Só avisa a interface se o jogo ativo mudou.
+        /// </summary>
+        public void Enforce()
+        {
+            Profile before = ActiveProfile;
+            IntPtr window = ActiveWindow;
+            Apply(false);
+            if (ActiveProfile != before || ActiveWindow != window) RaiseStateChanged();
+        }
+
         public void Apply()
+        {
+            Apply(true);
+        }
+
+        void Apply(bool notify)
         {
             Profile profile = null;
             if (_foreground != null && _foreground.ProcessId != _ownProcessId)
@@ -54,6 +74,11 @@ namespace ColorShift
             }
 
             ActiveProfile = profile;
+            if (notify) RaiseStateChanged();
+        }
+
+        void RaiseStateChanged()
+        {
             var handler = StateChanged;
             if (handler != null) handler(this, EventArgs.Empty);
         }

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
@@ -57,6 +57,8 @@ namespace ColorShift
 
             _watcher = new ForegroundWatcher();
             _watcher.Changed += _engine.OnForeground;
+            _watcher.Tick += _engine.Enforce;
+            _watcher.Tick += CheckExclusiveFullscreen;
             _engine.StateChanged += (s, e) => { UpdateStatus(); UpdateCrosshair(); };
             _engine.OnForeground(_watcher.Current());
 
@@ -386,6 +388,33 @@ namespace ColorShift
             Screen screen = game != IntPtr.Zero ? Screen.FromHandle(game) : Screen.PrimaryScreen;
             _overlay.Place(c, screen, visible);
             _crosshairMenu.Checked = c.Enabled;
+        }
+
+        [System.Runtime.InteropServices.DllImport("shell32.dll")]
+        static extern int SHQueryUserNotificationState(out int state);
+        const int QunsRunningD3DFullScreen = 3;
+        IntPtr _exclusiveWarnedFor;
+        int _exclusiveTicks;
+
+        /// <summary>
+        /// Em tela cheia exclusiva o Windows não compõe outras janelas por cima do jogo,
+        /// então a mira não tem como aparecer. Avisa uma vez por janela de jogo.
+        /// </summary>
+        void CheckExclusiveFullscreen()
+        {
+            IntPtr game = _engine.ActiveWindow;
+            int state;
+            bool exclusive = game != IntPtr.Zero && _settings.Crosshair.Enabled
+                && SHQueryUserNotificationState(out state) == 0 && state == QunsRunningD3DFullScreen;
+            // Exige ~2 s seguidos para não avisar durante a transição do Alt+Tab.
+            _exclusiveTicks = exclusive ? _exclusiveTicks + 1 : 0;
+            if (_exclusiveTicks < 8 || game == _exclusiveWarnedFor) return;
+            _exclusiveWarnedFor = game;
+            string name = _engine.ActiveProfile != null ? _engine.ActiveProfile.Name : "O jogo";
+            _tray.ShowBalloonTip(8000, "ColorShift — mira",
+                name + " está em tela cheia exclusiva, e nesse modo o Windows não deixa nada aparecer por cima. " +
+                "Nas opções de vídeo do jogo, mude para \"Janela sem bordas\" (Borderless / Tela cheia em janela).",
+                ToolTipIcon.Warning);
         }
 
         void UpdateStatus()
